@@ -1,35 +1,52 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from contextlib import asynccontextmanager
 import tensorflow as tf
-from PIL import Image
 import os
 import json
-import io
-import numpy as np
 from fastapi.responses import JSONResponse
-
-
+import torch.nn.modules.container
+from ultralytics import YOLO
+from ultralytics.nn.tasks import DetectionModel
+from ultralytics.yolo.utils import IterableSimpleNamespace
+import torch.serialization
+from ultralytics.nn.modules import (
+    Conv, C2f, SPPF, Bottleneck, Concat, Detect, DFL
+)
+from torch.nn.modules.activation import SiLU
+import torch.nn.modules.conv
+import torch.nn.modules.batchnorm
+import torch.nn.modules.pooling
+import torch.nn.modules.upsampling
+from core.is_tomato import is_tomato_leaf_yolo
+from core.disease_classifier import classify_disease
+import tempfile
+import shutil
 
 MODEL_DIR = "model"
 MODEL_PATH = os.path.join(MODEL_DIR, "tomato_disease_classifier(1).keras")
 CLASS_NAMES_PATH = os.path.join(MODEL_DIR, "class_names.json")
-IMAGE_SIZE = 128  
+TOMATO_MODEL_PATH = os.path.join(MODEL_DIR, "final_tomato_classifier.h5")
+IMAGE_SIZE = 128
 
 model = None
 class_names = None
+tomato_model = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global model, class_names
-    if not os.path.exists(MODEL_PATH) or not os.path.exists(CLASS_NAMES_PATH):
+    global model, class_names, tomato_model
+    if not os.path.exists(MODEL_PATH) or not os.path.exists(CLASS_NAMES_PATH) or not os.path.exists(TOMATO_MODEL_PATH):
         raise RuntimeError("Model or class names file not found. Make sure they are in the 'model/' directory.")
-    print(f"Loading model from: {MODEL_PATH}")
+    print(f"Loading disease model from: {MODEL_PATH}")
     model = tf.keras.models.load_model(MODEL_PATH)
-    print("Model loaded successfully.")
+    print("Disease model loaded successfully.")
     print(f"Loading class names from: {CLASS_NAMES_PATH}")
     with open(CLASS_NAMES_PATH, 'r') as f:
         class_names = json.load(f)
     print("Class names loaded successfully:", class_names)
+    print(f"Loading tomato/non-tomato model from: {TOMATO_MODEL_PATH}")
+    tomato_model = tf.keras.models.load_model(TOMATO_MODEL_PATH)
+    print("Tomato/non-tomato model loaded successfully.")
     yield
 
 app = FastAPI(
@@ -39,37 +56,44 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-
-def preprocess_image(image_bytes: bytes) -> tf.Tensor:
-    try:
-        img = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        img = img.resize((IMAGE_SIZE, IMAGE_SIZE))
-        img_array = tf.keras.preprocessing.image.img_to_array(img)
-        img_array = tf.expand_dims(img_array, 0)
-        return img_array
-    except Exception as e:
-        print(f"Error preprocessing image: {e}")
-        raise HTTPException(status_code=400, detail="Invalid image file provided.")
-
+with torch.serialization.safe_globals([
+    DetectionModel,
+    torch.nn.modules.container.ModuleList,
+    torch.nn.modules.container.Sequential,
+    Conv,
+    C2f,
+    SPPF,
+    Bottleneck,
+    Concat,
+    Detect,
+    DFL,
+    torch.nn.modules.conv.Conv2d,
+    torch.nn.modules.batchnorm.BatchNorm2d,
+    torch.nn.modules.pooling.MaxPool2d,
+    torch.nn.modules.upsampling.Upsample,
+    SiLU,
+    IterableSimpleNamespace,
+]):
+    yolo_model = YOLO(os.path.join(MODEL_DIR, "best.pt"))
+yolo_model.overrides['conf'] = 0.25
+yolo_model.overrides['iou'] = 0.45
+yolo_model.overrides['agnostic_nms'] = False
+yolo_model.overrides['max_det'] = 1000
 
 @app.post("/predict/")
 async def predict(file: UploadFile = File(...)):
-
-    if model is None or class_names is None:
-        raise HTTPException(status_code=503, detail="Model is not loaded yet. Please wait.")
-        
     image_bytes = await file.read()
-    
-    preprocessed_image = preprocess_image(image_bytes)
-    
-    predictions = model.predict(preprocessed_image)
-    score_array = predictions[0]  
 
-    predicted_class_index = np.argmax(score_array)
-    predicted_class = class_names[predicted_class_index]
-    confidence_score = float(np.max(score_array)) * 100
-    
-    print(f"Prediction: {predicted_class}, Confidence: {confidence_score:.2f}%")
+    # YOLO tomato leaf check
+    is_tomato, tomato_conf = is_tomato_leaf_yolo(image_bytes, yolo_model)
+    if not is_tomato:
+        return JSONResponse(content={
+            "predicted_class": "Not a tomato leaf",
+            "confidence": f"{tomato_conf:.2f}%"
+        })
+
+    # Disease classification
+    predicted_class, confidence_score = classify_disease(image_bytes, model, class_names)
     
     return JSONResponse(content={
         "predicted_class": predicted_class,
