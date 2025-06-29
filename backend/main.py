@@ -91,7 +91,6 @@ async def predict(file: UploadFile = File(...)):
             "predicted_class": "Not a tomato leaf",
             "confidence": f"{tomato_conf:.2f}%"
         })
-
     # Disease classification
     predicted_class, confidence_score = classify_disease(image_bytes, model, class_names)
     
