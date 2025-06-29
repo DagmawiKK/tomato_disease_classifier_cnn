@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+tensorflow
+torch
+ultralytics
+pillow
+numpy
+streamlit
+requests
+pandas
